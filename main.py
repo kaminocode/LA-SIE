@@ -98,9 +98,7 @@ def main():
         signal.signal(signal.SIGTERM, handle_sigterm)
         # find a common host name on all nodes
         # assume scontrol returns hosts in the same order on all nodes
-        cmd = "scontrol show hostnames " + os.getenv("SLURM_JOB_NODELIST")
-        stdout = subprocess.check_output(cmd.split())
-        host_name = stdout.decode().splitlines()[0]
+        host_name = os.environ["MASTER_ADDR"]
         args.rank = int(os.getenv("SLURM_NODEID")) * args.ngpus_per_node
         args.world_size = int(os.getenv("SLURM_NNODES")) * args.ngpus_per_node
         args.dist_url = f"tcp://{host_name}:{args.port}"
@@ -121,6 +119,10 @@ def main_worker(gpu, args):
         world_size=args.world_size,
         rank=args.rank,
     )
+    if args.rank == 0:
+        args.exp_dir.mkdir(parents=True, exist_ok=True)
+        args.root_log_dir.mkdir(parents=True, exist_ok=True)
+
     # Config dump
     if args.rank == 0:
         dict_args = deepcopy(vars(args))
@@ -140,10 +142,7 @@ def main_worker(gpu, args):
         writer = SummaryWriter(log_dir=logdir)
 
     if args.rank == 0:
-        args.exp_dir.mkdir(parents=True, exist_ok=True)
-        args.root_log_dir.mkdir(parents=True, exist_ok=True)
         print(" ".join(sys.argv))
-
     torch.cuda.set_device(gpu)
     torch.backends.cudnn.benchmark = True
 
