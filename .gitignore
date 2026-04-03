@@ -1,0 +1,49 @@
+# Project-specific
+AGENTS.md
+.codex
+.py_pkgs/
+slurm/
+
+# Weights & Biases
+.wandb/
+wandb/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.env
+.venv/
+env/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data & model artifacts
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.h5
+runs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+
+# Logs
+*.log
+*.err
+*.out
