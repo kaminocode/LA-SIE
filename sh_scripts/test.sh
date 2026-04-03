@@ -59,6 +59,8 @@ MAIN_ARGS=(
   --mlp 2048-2048-2048
   --equi-factor 0.45
   --hypernetwork linear
+  --wandb
+  --wandb-name "test_run"
 )
 
 apptainer exec --nv \
