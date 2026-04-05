@@ -24,6 +24,7 @@ import copy
 import argparse
 import src.resnet as resnet
 import errno
+from src.latent_action_eval import is_latent_action_checkpoint, load_experiment_args
 
 from tqdm import tqdm
 
@@ -38,6 +39,16 @@ parser.add_argument("--dataset-root", type=Path, default="DATA_FOLDER", required
 
 
 args = parser.parse_args()
+
+if (args.exp_dir / "params.json").is_file():
+    train_args = load_experiment_args(args.exp_dir)
+    if is_latent_action_checkpoint(train_args):
+        raise ValueError(
+            "MRR / H@k are only defined for the original SIE predictor path. "
+            "For latent-action checkpoints, use eval_latent_action_diagnostics.py and "
+            "eval_latent_action_latent_code.py instead."
+        )
+
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.spatial.transform import Rotation as R
@@ -332,4 +343,3 @@ for source,target in [("train","train"),("val","val")]:
             "H@10":H_at_10.item()
         }) + '\n')
         fd.flush()
-

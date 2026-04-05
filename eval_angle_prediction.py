@@ -17,7 +17,6 @@ from torchvision import  transforms
 
 import os.path
 from torch.utils.tensorboard import SummaryWriter
-from copy import deepcopy
 from pathlib import Path
 import json
 import sys
@@ -27,6 +26,7 @@ import copy
 
 import argparse
 import src.resnet as resnet
+from src.logging_utils import ScalarLogger, args_to_serializable_dict
 
 parser = argparse.ArgumentParser()
 
@@ -37,6 +37,9 @@ parser.add_argument("--deep-end", action="store_true",help="If used, uses a MLP 
 parser.add_argument("--equi-dims",type=int,default=512,help="Number of equivariant dimensions (to evaluate). Put the full size to evaluate the whole representation.")
 parser.add_argument("--inv-part",action="store_true",help="Whether or not to evaluate the invariant part")
 parser.add_argument("--dataset-root", type=Path, default="DATA_FOLDER", required=True)
+parser.add_argument("--train-images-file", type=Path, default=Path("./data/train_images.npy"))
+parser.add_argument("--val-images-file", type=Path, default=Path("./data/val_images.npy"))
+parser.add_argument("--size-dataset", type=int, default=-1)
 
 # Experience loading
 parser.add_argument("--weights-file", type=str, default="./resnet50.pth")
@@ -52,6 +55,11 @@ parser.add_argument("--wd", type=float, default=0)
 parser.add_argument("--exp-dir", type=Path, default="")
 parser.add_argument("--root-log-dir", type=Path,default="EXP_DIR/logs/")
 parser.add_argument("--log-freq-time", type=int, default=10)
+parser.add_argument("--wandb", action="store_true")
+parser.add_argument("--wandb-project", type=str, default=os.environ.get("WANDB_PROJECT", ""))
+parser.add_argument("--wandb-entity", type=str, default=os.environ.get("WANDB_ENTITY", ""))
+parser.add_argument("--wandb-name", type=str, default="")
+parser.add_argument("--wandb-dir", type=Path, default=None)
 
 # Running
 parser.add_argument("--num-workers", type=int, default=10)
@@ -117,11 +125,12 @@ class Dataset3DIEBench(Dataset):
     def __getitem__(self, i):
         # Latent vector creation
         views = self.rng.choice(50,2, replace=False)
-        img_1 = self.get_img(self.dataset_root + self.samples[i]+ f"/image_{views[0]}.jpg")
-        img_2 = self.get_img(self.dataset_root + self.samples[i]+ f"/image_{views[1]}.jpg")         
-    
-        angles_1 =np.load(self.dataset_root + self.samples[i]+ f"/latent_{views[0]}.npy")[:3].astype(np.float32)
-        angles_2 =np.load(self.dataset_root + self.samples[i]+ f"/latent_{views[1]}.npy")[:3].astype(np.float32)
+        sample_root = self.dataset_root / str(self.samples[i]).lstrip("/")
+        img_1 = self.get_img(sample_root / f"image_{views[0]}.jpg")
+        img_2 = self.get_img(sample_root / f"image_{views[1]}.jpg")         
+
+        angles_1 = np.load(sample_root / f"latent_{views[0]}.npy")[:3].astype(np.float32)
+        angles_2 = np.load(sample_root / f"latent_{views[1]}.npy")[:3].astype(np.float32)
         rot_1 = R.from_euler("xyz",angles_1)
         rot_2 = R.from_euler("xyz",angles_2)
         rot_1_to_2 = rot_1.inv()*rot_2
@@ -189,10 +198,10 @@ def load_from_state_dict(model, state_dict, prefix, new_suffix):
         print("Load pretrained model with msg: {}".format(msg))
 
 ### INIT STUFF
-dict_args = deepcopy(vars(args))
-for key,value in dict_args.items():
-    if isinstance(value,Path):
-        dict_args[key] = str(value)
+args.exp_dir.mkdir(parents=True, exist_ok=True)
+args.root_log_dir.mkdir(parents=True, exist_ok=True)
+
+dict_args = args_to_serializable_dict(args)
 with open(args.exp_dir / "params.json", 'w') as f:
     json.dump(dict_args, f)
 
@@ -202,19 +211,28 @@ else:
     exp_name = str(args.exp_dir).split("/")[-1]
 logdir = args.root_log_dir / exp_name
 writer = SummaryWriter(log_dir=logdir)
+logger = ScalarLogger(
+    writer,
+    use_wandb=args.wandb,
+    project=args.wandb_project or None,
+    entity=args.wandb_entity or None,
+    name=args.wandb_name or exp_name,
+    run_dir=args.wandb_dir if args.wandb_dir is not None else args.exp_dir,
+    config=dict_args,
+)
 
-args.exp_dir.mkdir(parents=True, exist_ok=True)
-args.root_log_dir.mkdir(parents=True, exist_ok=True)
 print(" ".join(sys.argv))
 
 
 ### DATA
 
 ds_train = Dataset3DIEBench(args.dataset_root,
-                            "./data/train_images.npy",args.experience,
+                            args.train_images_file,args.experience,
+                               size_dataset=args.size_dataset,
                                transform=transforms.Compose([transforms.ToTensor(),normalize]))
 ds_val = Dataset3DIEBench(args.dataset_root,
-                            "./data/val_images.npy",args.experience,
+                            args.val_images_file,args.experience,
+                             size_dataset=args.size_dataset,
                              transform=transforms.Compose([transforms.ToTensor(),normalize]))
 
 train_loader = torch.utils.data.DataLoader(ds_train, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
@@ -261,10 +279,10 @@ for epoch in range(start_epoch,epochs):
         loss = F.mse_loss(outputs, latents)
         r2 = r2_score(outputs,latents)
         if step%args.log_freq_time == 0:
-            writer.add_scalar('Loss/loss', loss.item(), step)
-            writer.add_scalar('Metrics/train_R2', r2.item(), step)
-            writer.add_scalar('General/lr', args.lr, step)
-            writer.flush()
+            logger.add_scalar('Loss/loss', loss.item(), step)
+            logger.add_scalar('Metrics/train_R2', r2.item(), step)
+            logger.add_scalar('General/lr', args.lr, step)
+            logger.flush()
 
         loss.backward()
         optimizer.step()
@@ -289,9 +307,9 @@ for epoch in range(start_epoch,epochs):
                 total_latents = torch.cat((total_latents,latents.cpu()),axis=0)
                 total_preds = torch.cat((total_preds,outputs.cpu()),axis=0)
         r2 = r2_score(total_preds,total_latents)
-        writer.add_scalar('Metrics/val_MSE', avg_mse, step)
-        writer.add_scalar('Metrics/val_R2', r2.item(), step)
-        writer.flush()
+        logger.add_scalar('Metrics/val_MSE', avg_mse, step)
+        logger.add_scalar('Metrics/val_R2', r2.item(), step)
+        logger.flush()
         print(f"[Epoch {epoch}, validation]: MSE: {avg_mse:.6f}, R2 score: {r2.item():.3f}")
     
     ## CHECKPOINT
@@ -301,6 +319,8 @@ for epoch in range(start_epoch,epochs):
                 optimizer=optimizer.state_dict(),
             )
     torch.save(state, args.exp_dir / "model.pth")
+
+logger.close()
 
 def handle_sigusr1(signum, frame):
     os.system(f'scontrol requeue {os.environ["SLURM_JOB_ID"]}')

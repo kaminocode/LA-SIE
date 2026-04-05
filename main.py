@@ -22,18 +22,16 @@ from torch.utils.tensorboard import SummaryWriter
 #import augmentations as aug
 
 import src.dataset as ds
+import src.experience_registry as exp_registry
+from src.logging_utils import ScalarLogger, args_to_serializable_dict
 import src.models as m
-from copy import deepcopy
 
 parser = argparse.ArgumentParser()
 
 # Model
 parser.add_argument("--arch", type=str, default="resnet18")
 parser.add_argument("--equi", type=int, default=256)
-parser.add_argument("--experience", type=str, choices=["SIENoVar","SIE","SIEOnlyEqui","VICReg","SimCLR","VICRegPartInv",
-                                                        "SimCLROnlyEqui","SIERotColor","SimCLRAugSelf","SimCLRAugSelfRotColor",
-                                                        "SimCLROnlyEquiRotColor","SimCLREquiModRotColor","SimCLREquiMod","VICRegEquiMod"],
-                                                        default="SIE")
+parser.add_argument("--experience", type=str, choices=exp_registry.ALL_EXPERIENCES, default="SIE")
 parser.add_argument("--hypernetwork", type=str, choices=["linear","deep"],default="linear")
 # Only for when using an expander
 parser.add_argument("--mlp", default="2048-2048-2048")
@@ -49,6 +47,19 @@ parser.add_argument("--bias-hypernet", action="store_true")
 parser.add_argument("--simclr-temp",type=float,default=0.1)
 parser.add_argument("--ec-weight",type=float,default=1)
 parser.add_argument("--tf-num-layers",type=int,default=1)
+parser.add_argument("--latent-action-dim", type=int, default=8)
+parser.add_argument("--num-generators", type=int, default=8)
+parser.add_argument("--latent-operator-hidden-dim", type=int, default=None)
+parser.add_argument("--latent-align-weight", type=float, default=None)
+parser.add_argument("--latent-identity-weight", type=float, default=1.0)
+parser.add_argument("--latent-inverse-weight", type=float, default=1.0)
+parser.add_argument("--latent-composition-weight", type=float, default=1.0)
+parser.add_argument("--latent-enable-identity", action="store_true")
+parser.add_argument("--latent-enable-inverse", action="store_true")
+parser.add_argument("--latent-enable-composition", action="store_true")
+parser.add_argument("--latent-enable-pred-std", action="store_true")
+parser.add_argument("--latent-online-eval", action="store_true")
+parser.add_argument("--latent-online-eval-samples", type=int, default=16)
 
 
 
@@ -67,6 +78,7 @@ parser.add_argument("--dataset-root", type=Path, default="DATA_FOLDER", required
 parser.add_argument("--images-file", type=Path, default="./data/train_images.npy", required=True)
 parser.add_argument("--labels-file", type=Path, default="./data/val_images.npy", required=True)
 parser.add_argument("--resolution", type=int, default=256)
+parser.add_argument("--size-dataset", type=int, default=-1)
 
 # Checkpoints
 parser.add_argument("--exp-dir", type=Path, default="")
@@ -74,6 +86,11 @@ parser.add_argument("--root-log-dir", type=Path,default="EXP_DIR/logs/")
 parser.add_argument("--evaluate", action="store_true")
 parser.add_argument("--eval-freq", type=int, default=10)
 parser.add_argument("--log-freq-time", type=int, default=30)
+parser.add_argument("--wandb", action="store_true")
+parser.add_argument("--wandb-project", type=str, default=os.environ.get("WANDB_PROJECT", ""))
+parser.add_argument("--wandb-entity", type=str, default=os.environ.get("WANDB_ENTITY", ""))
+parser.add_argument("--wandb-name", type=str, default="")
+parser.add_argument("--wandb-dir", type=Path, default=None)
 
 # Loss
 parser.add_argument("--sim-coeff", type=float, default=10.0)
@@ -125,10 +142,7 @@ def main_worker(gpu, args):
 
     # Config dump
     if args.rank == 0:
-        dict_args = deepcopy(vars(args))
-        for key,value in dict_args.items():
-            if isinstance(value,Path):
-                dict_args[key] = str(value)
+        dict_args = args_to_serializable_dict(args)
         with open(args.exp_dir / "params.json", 'w') as f:
             json.dump(dict_args, f)
 
@@ -140,6 +154,15 @@ def main_worker(gpu, args):
             exp_name = str(args.exp_dir).split("/")[-1]
         logdir = args.root_log_dir / exp_name
         writer = SummaryWriter(log_dir=logdir)
+        logger = ScalarLogger(
+            writer,
+            use_wandb=args.wandb,
+            project=args.wandb_project or None,
+            entity=args.wandb_entity or None,
+            name=args.wandb_name or exp_name,
+            run_dir=args.wandb_dir if args.wandb_dir is not None else args.exp_dir,
+            config=dict_args,
+        )
 
     if args.rank == 0:
         print(" ".join(sys.argv))
@@ -149,10 +172,35 @@ def main_worker(gpu, args):
     normalize = transforms.Normalize(
        mean=[0.5016, 0.5037, 0.5060], std=[0.1030, 0.0999, 0.0969]
     )
-    if args.experience in ["SIERotColor","SimCLRAugSelfRotColor","SimCLROnlyEquiRotColor","SimCLREquiModRotColor"]:
-        dataset = ds.Dataset3DIEBenchRotColor(args.dataset_root,args.images_file, args.labels_file,transform=transforms.Compose([ transforms.Resize((args.resolution,args.resolution)),transforms.ToTensor(),normalize]))
+    transform = transforms.Compose([
+        transforms.Resize((args.resolution, args.resolution)),
+        transforms.ToTensor(),
+        normalize,
+    ])
+    if exp_registry.is_triplet_experience(args.experience):
+        dataset = ds.Dataset3DIEBenchTriplet(
+            args.dataset_root,
+            args.images_file,
+            args.labels_file,
+            size_dataset=args.size_dataset,
+            transform=transform,
+        )
+    elif exp_registry.uses_rotcolor_dataset(args.experience):
+        dataset = ds.Dataset3DIEBenchRotColor(
+            args.dataset_root,
+            args.images_file,
+            args.labels_file,
+            size_dataset=args.size_dataset,
+            transform=transform,
+        )
     else:
-        dataset = ds.Dataset3DIEBench(args.dataset_root,args.images_file, args.labels_file,transform=transforms.Compose([ transforms.Resize((args.resolution,args.resolution)),transforms.ToTensor(),normalize]))
+        dataset = ds.Dataset3DIEBench(
+            args.dataset_root,
+            args.images_file,
+            args.labels_file,
+            size_dataset=args.size_dataset,
+            transform=transform,
+        )
     sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)
     assert args.batch_size % args.world_size == 0
     per_device_batch_size = args.batch_size // args.world_size
@@ -192,18 +240,34 @@ def main_worker(gpu, args):
     scaler = torch.cuda.amp.GradScaler(enabled=not args.no_amp)
     for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
-        for step, (x, y, z, labels) in enumerate(loader, start=epoch * len(loader)):
-            x = x.cuda(gpu, non_blocking=True)
-            y = y.cuda(gpu, non_blocking=True)
-            z = z.cuda(gpu, non_blocking=True)
-            labels = labels.cuda(gpu, non_blocking=True)
+        for step, batch in enumerate(loader, start=epoch * len(loader)):
+            if exp_registry.is_triplet_experience(args.experience):
+                x0, x1, x2, z01, z12, z02, labels = batch
+                x0 = x0.cuda(gpu, non_blocking=True)
+                x1 = x1.cuda(gpu, non_blocking=True)
+                x2 = x2.cuda(gpu, non_blocking=True)
+                z01 = z01.cuda(gpu, non_blocking=True)
+                z12 = z12.cuda(gpu, non_blocking=True)
+                z02 = z02.cuda(gpu, non_blocking=True)
+                labels = labels.cuda(gpu, non_blocking=True)
+            else:
+                x, y, z, labels = batch
+                x = x.cuda(gpu, non_blocking=True)
+                y = y.cuda(gpu, non_blocking=True)
+                z = z.cuda(gpu, non_blocking=True)
+                labels = labels.cuda(gpu, non_blocking=True)
 
             
             optimizer.zero_grad()
 
             # MAIN TRAINING PART
             with torch.cuda.amp.autocast(enabled=not args.no_amp):
-                loss, classif_loss, stats, stats_eval = model.forward(x, y, z,labels)
+                if exp_registry.is_triplet_experience(args.experience):
+                    loss, classif_loss, stats, stats_eval = model.forward(
+                        x0, x1, x2, z01, z12, z02, labels
+                    )
+                else:
+                    loss, classif_loss, stats, stats_eval = model.forward(x, y, z, labels)
                 total_loss = loss + classif_loss
 
             scaler.scale(total_loss).backward()
@@ -213,49 +277,51 @@ def main_worker(gpu, args):
             current_time = time.time()
             if args.rank == 0 and current_time - last_logging > args.log_freq_time:
                 # General logs
-                writer.add_scalar('General/epoch', epoch, step)
-                writer.add_scalar('General/time_elapsed', int(current_time - start_time), step)
-                #writer.add_scalar('General/lr', lr, step)
-                writer.add_scalar('General/lr', args.base_lr, step)
-                writer.add_scalar('General/Current GPU memory', torch.cuda.memory_allocated(torch.cuda.device('cuda:0'))/1e9, step)
-                writer.add_scalar('General/Max GPU memory', torch.cuda.max_memory_allocated(torch.cuda.device('cuda:0'))/1e9, step)
+                logger.add_scalar('General/epoch', epoch, step)
+                logger.add_scalar('General/time_elapsed', int(current_time - start_time), step)
+                #logger.add_scalar('General/lr', lr, step)
+                logger.add_scalar('General/lr', args.base_lr, step)
+                logger.add_scalar('General/Current GPU memory', torch.cuda.memory_allocated(torch.cuda.device('cuda:0'))/1e9, step)
+                logger.add_scalar('General/Max GPU memory', torch.cuda.max_memory_allocated(torch.cuda.device('cuda:0'))/1e9, step)
 
                 # Loss related logs
-                writer.add_scalar('Loss/Total loss', stats["loss"].item(), step)
+                logger.add_scalar('Loss/Total loss', stats["loss"].item(), step)
                 if args.experience in ["SimCLRAugSelf","SimCLRAugSelfFull","SimCLRAugSelfRotColor"]:
-                    writer.add_scalar('Loss/Invariance loss', stats["repr_loss_inv"].item(), step)
+                    logger.add_scalar('Loss/Invariance loss', stats["repr_loss_inv"].item(), step)
                 if not args.experience in ["SimCLR","SimCLRAugSelf","SimCLRAugSelfFull","SimCLRAugSelfRotColor","SimCLROnlyEqui","SimCLROnlyEquiRotColor","SimCLREquiModRotColor","SimCLREquiMod"]:
-                    writer.add_scalar('Loss/Invariance loss', stats["repr_loss_inv"].item(), step)
-                    writer.add_scalar('Loss/Std loss', stats["std_loss"].item(), step)
-                    writer.add_scalar('Loss/Covariance loss', stats["cov_loss"].item(), step)
+                    logger.add_scalar('Loss/Invariance loss', stats["repr_loss_inv"].item(), step)
+                    logger.add_scalar('Loss/Std loss', stats["std_loss"].item(), step)
+                    logger.add_scalar('Loss/Covariance loss', stats["cov_loss"].item(), step)
                 if not args.experience in ["VICReg","VICRegNoCov","VICRegCos","VICRegL1","VICRegL1repr","FullEqui","VICRegPartInv","SimCLR","VICRegPartInv2Exps","SimCLROnlyEqui","SIERotColor","SimCLROnlyEquiRotColor"] :
-                    writer.add_scalar('Loss/Equivariance loss', stats["repr_loss_equi"].item(), step)
+                    logger.add_scalar('Loss/Equivariance loss', stats["repr_loss_equi"].item(), step)
                 if args.experience in ["SIEOnlyEqui","SIE","SIEAll","SIERotColor"]:
-                    writer.add_scalar('Loss/Pred Std loss', stats["pred_std_loss"].item(), step)
+                    logger.add_scalar('Loss/Pred Std loss', stats["pred_std_loss"].item(), step)
+                if exp_registry.is_latent_action_experience(args.experience) and args.latent_enable_pred_std:
+                    logger.add_scalar('Loss/Pred Std loss', stats["pred_std_loss"].item(), step)
                 # Representations/embeddings stats
-                writer.add_scalar('Stats/Corr. representations view1', stats["coremb_view1"].item(), step)
-                writer.add_scalar('Stats/Corr. representations view2', stats["coremb_view2"].item(), step)
-                writer.add_scalar('Stats/Std representations view1', stats["stdemb_view1"].item(), step)
-                writer.add_scalar('Stats/Std representations view2', stats["stdemb_view2"].item(), step)
-                writer.add_scalar('Stats/Corr. embeddings view1', stats["corhead_view1"].item(), step)
-                writer.add_scalar('Stats/Corr. embeddings view2', stats["corhead_view2"].item(), step)
-                writer.add_scalar('Stats/Std embeddings view1', stats["stdhead_view1"].item(), step)
-                writer.add_scalar('Stats/Std embeddings view2', stats["stdhead_view2"].item(), step)
+                logger.add_scalar('Stats/Corr. representations view1', stats["coremb_view1"].item(), step)
+                logger.add_scalar('Stats/Corr. representations view2', stats["coremb_view2"].item(), step)
+                logger.add_scalar('Stats/Std representations view1', stats["stdemb_view1"].item(), step)
+                logger.add_scalar('Stats/Std representations view2', stats["stdemb_view2"].item(), step)
+                logger.add_scalar('Stats/Corr. embeddings view1', stats["corhead_view1"].item(), step)
+                logger.add_scalar('Stats/Corr. embeddings view2', stats["corhead_view2"].item(), step)
+                logger.add_scalar('Stats/Std embeddings view1', stats["stdhead_view1"].item(), step)
+                logger.add_scalar('Stats/Std embeddings view2', stats["stdhead_view2"].item(), step)
                 if "stdemb_pred" in stats.keys():
-                    writer.add_scalar('Stats/Corr. predictor output', stats["coremb_pred"].item(), step)
-                    writer.add_scalar('Stats/Std predictor output', stats["stdemb_pred"].item(), step)
+                    logger.add_scalar('Stats/Corr. predictor output', stats["coremb_pred"].item(), step)
+                    logger.add_scalar('Stats/Std predictor output', stats["stdemb_pred"].item(), step)
 
                 
                 # Online evaluation logs
                 for key,value in stats_eval.items():
                     if "representations" in key:
-                        writer.add_scalar(f'Online eval reprs/{key}', value, step)
+                        logger.add_scalar(f'Online eval reprs/{key}', value, step)
                     elif "embeddings" in key:
-                        writer.add_scalar(f'Online eval embs/{key}', value, step)
+                        logger.add_scalar(f'Online eval embs/{key}', value, step)
                 for key,value in stats.items():
-                    if "Latent/" in key:
-                        writer.add_scalar(key, value, step)
-                writer.flush()
+                    if key.startswith("Latent/") or key.startswith("LatentEval/"):
+                        logger.add_scalar(key, value, step)
+                logger.flush()
                 print("Logged, step :",step)
                 last_logging = current_time
         if args.rank == 0:
@@ -266,7 +332,7 @@ def main_worker(gpu, args):
             )
             torch.save(state, args.exp_dir / "model.pth")
     if args.rank == 0:
-        writer.close()
+        logger.close()
         torch.save(model.module.backbone.state_dict(), args.exp_dir / "final_weights.pth")
 
 

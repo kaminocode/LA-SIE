@@ -1711,3 +1711,18 @@ def r2_score(output, target):
     ss_res = torch.sum((target - output) ** 2)
     r2 = 1 - ss_res / ss_tot
     return r2
+
+
+from src.latent_action_models import (  # noqa: E402
+    direct_full_matrix_2v,
+    direct_skewexp_2v,
+    latentcode_to_full_matrix_2v,
+    sharedgen_fixed_2v,
+    sharedgen_learned_2v,
+    sharedgen_learned_2v_identity,
+    sharedgen_learned_2v_inverse,
+    sharedgen_learned_3v_comp,
+    sharedgen_learned_3v_no_comp,
+)
+
+sie_oracle = SIE
